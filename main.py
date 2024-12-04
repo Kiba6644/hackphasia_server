@@ -1,10 +1,16 @@
 from flask import Flask, request, jsonify, send_from_directory, Response
 from flask_sqlalchemy import SQLAlchemy
 from flask_bcrypt import Bcrypt
-from datetime import datetime
+import requests
+import fitz
+import moviepy as mp
+import torchaudio
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline, WhisperProcessor, WhisperForConditionalGeneration
+from datetime import datetime, timedelta
 from libretranslatepy import LibreTranslateAPI
 from sqlalchemy.orm import class_mapper
 import os
+import random
 from werkzeug.utils import secure_filename
 
 UPLOAD_FOLDER_MICRO = 'uploads/microcourses'
@@ -31,7 +37,6 @@ class User(db.Model):
     preferred_language = db.Column(db.Integer)
     badges = db.Column(db.JSON) 
     certificates = db.Column(db.JSON) 
-    posts = db.Column(db.JSON) 
     attendance = db.Column(db.Integer, default=10)
     streaks = db.Column(db.Integer, default=7)
     prev_date = db.Column(db.Date)
@@ -73,8 +78,7 @@ class otherfunc():
         certificate_score = sum(certificate['score'] for certificate in user.certificates) if user.certificates else 0
         streak_score = user.streaks * 1.5
         attendance_score = user.attendance
-        posts_score = len(user.posts) * 50
-        total_score = badge_score + certificate_score + streak_score + attendance_score + posts_score
+        total_score = badge_score + certificate_score + streak_score + attendance_score
         
         return total_score
 
@@ -97,6 +101,81 @@ class otherfunc():
             random.shuffle(all_courses)
 
             return all_courses
+
+    def download_pdf(pdf_url, save_path="temp.pdf"):
+        response = requests.get(pdf_url, stream=True)
+        if response.status_code == 200:
+            with open(save_path, "wb") as pdf_file:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        pdf_file.write(chunk)
+            return save_path
+        else:
+            raise Exception(f"Failed to download PDF. Status code: {response.status_code}")
+    def extract_text_from_pdf(pdf_path):
+        doc = fitz.open(pdf_path)
+        text = ""
+        for page in doc:
+            text += page.get_text()
+        doc.close()
+        return text
+    def summarize_text(text, model_name="t5-small"):
+        summarizer = pipeline("summarization", model=model_name)
+        max_chunk = 512  # T5 models have a token limit
+        chunks = [text[i:i + max_chunk] for i in range(0, len(text), max_chunk)]
+        summarized_chunks = [
+            summarizer(chunk, max_length=50, min_length=10, do_sample=False)[0]["summary_text"]
+            for chunk in chunks
+        ]
+        return " ".join(summarized_chunks)
+    def translate_text(text, target_language="fr"):
+        model_name = f"Helsinki-NLP/opus-mt-en-{target_language}"
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        
+        inputs = tokenizer(text, return_tensors="pt", truncation=True)
+        outputs = model.generate(**inputs)
+        translated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        return translated_text
+
+    def download_video(video_url, save_path="temp_video.mp4"):
+        response = requests.get(video_url, stream=True)
+        with open(save_path, "wb") as video_file:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    video_file.write(chunk)
+        return save_path
+
+    def extract_audio(video_path, audio_path):
+        video = mp.VideoFileClip(video_path)
+        video.audio.write_audiofile(audio_path)
+        
+    def transcribe_audio(audio_path, model_name="openai/whisper-tiny"):
+        processor = WhisperProcessor.from_pretrained(model_name)
+        model = WhisperForConditionalGeneration.from_pretrained(model_name)
+
+        waveform, rate = torchaudio.load(audio_path)
+        if rate != 16000:
+            waveform = torchaudio.transforms.Resample(orig_freq=rate, new_freq=16000)(waveform)
+        inputs = processor(waveform.squeeze().numpy(), return_tensors="pt", sampling_rate=16000)
+        predicted_ids = model.generate(inputs["input_features"])
+        transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
+        return transcription
+
+    def summarize_text(text, model_name="t5-small"):
+        summarizer = pipeline("summarization", model=model_name)
+        summary = summarizer(text, max_length=50, min_length=10, do_sample=False)
+        return summary[0]["summary_text"]
+
+    def translate_text(text, target_language="fr"):
+        model_name = f"Helsinki-NLP/opus-mt-en-{target_language}"
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        
+        inputs = tokenizer(text, return_tensors="pt", truncation=True)
+        outputs = model.generate(**inputs)
+        translated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        return translated_text
 
 @app.route('/')
 def home():
@@ -140,20 +219,19 @@ def register():
     gender = data.get('gender')
     preferred_language = data.get('preferred_language')
 
-    existing_user = User.query.filter_by(username=username).first()
+    existing_user = User.query.filter_by(name=name).first()
     if existing_user:
         return jsonify({"message": "Username already exists"}), 400
 
     hashed_password = bcrypt.generate_password_hash(password).decode('utf-8')
     new_user = User(
-        username=username,
         password=hashed_password,
         name=name,
         email=email,
         phone=phone,
         age=age,
         gender=gender,
-        preferred_language=preferred_language,,
+        preferred_language=preferred_language,
         attendance=0,
         streaks=0
     )
@@ -180,64 +258,6 @@ def login():
         return jsonify({"message": "Invalid password"}), 401
 
     return jsonify({"message": "Login successful", "username": user.username}), 200
-    
-@app.route('/upload_course', methods=['POST'])
-def upload_course():
-    data = request.form
-    name = data.get('name')
-    course_type = data.get('course_type')
-    video_title = data.get('video_title')
-    description = data.get('description')
-    user = User.query.filter_by(name=name).first()
-    if not course_type or course_type not in ['micro', 'main']:
-        return jsonify({"message": "Invalid course type. Choose 'micro' or 'main'."}), 400
-
-    if 'file' not in request.files:
-        return jsonify({"message": "No file part."}), 400
-    
-    file = request.files['file']
-    
-    if file.filename == '':
-        return jsonify({"message": "No selected file."}), 400
-    
-    if file.filename.lower().endswith('.mp4'):
-        course_id = db.session.query(db.func.max(MicroCourse.course_id if course_type == 'micro' else MainCourse.course_id)).scalar() + 1
-        
-        filename = secure_filename(f"{course_id}.mp4")
-        
-        if course_type == 'micro':
-            file.save(os.path.join(UPLOAD_FOLDER_MICRO, filename))
-            new_course = MicroCourse(
-                course_id=course_id,
-                video_path=os.path.join(UPLOAD_FOLDER_MICRO, filename),
-                video_title=video_title,
-                description=description
-            )
-        else:
-            file.save(os.path.join(UPLOAD_FOLDER_MAIN, filename))
-            new_course = MainCourse(
-                course_id=course_id,
-                video_path=os.path.join(UPLOAD_FOLDER_MAIN, filename),
-                video_title=video_title,
-                description=description
-            )
-        db.session.add(new_course)
-        db.session.commit()
-        new_post = {
-            'course_id': course_id,
-            'title': video_title,
-            'description': description,
-            'date_uploaded': datetime.utcnow().strftime('%d-%m-%Y')
-        }
-
-        if user.posts:
-            user.posts.append(new_post)
-        else:
-            user.posts = [new_post]
-        db.session.commit()
-        return jsonify({"message": f"{course_type.capitalize()} course uploaded successfully", "course_id": course_id}), 201
-
-    return jsonify({"message": "File type not allowed. Only MP4 files are allowed."}), 400
 
 @app.route('/stream_course/<int:course_id>', methods=['GET'])
 def stream_course(course_id):
@@ -347,7 +367,7 @@ def get_leaderboard():
     user_scores = []
 
     for user in users:
-        score = calculate_user_score(user)
+        score = otherfunc.calculate_user_score(user)
         user_scores.append({
             'username': user.username,
             'score': score,
@@ -361,6 +381,46 @@ def get_leaderboard():
     sorted_user_scores = sorted(user_scores, key=lambda x: x['score'], reverse=True)
 
     return jsonify(sorted_user_scores), 200
+
+@app.route('/translate_pdf')
+def translate_pdf():
+    data = request.get_json()
+    name = data.get('name')
+    user = User.query.filter_by(name=name).first()
+    pdf_path = otherfunc.download_pdf(data.get('url'))
+
+    extracted_text = otherfunc.extract_text_from_pdf(pdf_path)
+
+    summary = otherfunc.summarize_text(extracted_text)
+
+    print("Translating summary...")
+    translated_summary = otherfunc.translate_text(summary, user.preferred_language)
+    os.remove(pdf_path)
+
+    return jsonify(summary, translated_summary)
+
+@app.route('/video')
+def transcribe_video():
+    data = request.get_json()
+    name = data.get('name')
+    user = User.query.filter_by(name=name).first()
+
+    video_path = "temp_video.mp4"
+    audio_path = "temp_audio.wav"
+    otherfunc.download_video(data.get('url'), video_path)
+    
+    otherfunc.extract_audio(video_path, audio_path)
+
+    transcribed_text = otherfunc.transcribe_audio(audio_path)
+
+    summary = otherfunc.summarize_text(transcribed_text)
+
+    translated_summary = otherfunc.translate_text(summary, user.preferred_language)
+
+    os.remove(video_path)
+    os.remove(audio_path)
+    
+    return summary, translated_summary
 
 
 if __name__ == '__main__':
