@@ -3,6 +3,7 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_bcrypt import Bcrypt
 import requests
 import fitz
+from flask_cors import CORS
 import moviepy as mp
 import torchaudio
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline, WhisperProcessor, WhisperForConditionalGeneration
@@ -17,7 +18,7 @@ UPLOAD_FOLDER_MICRO = 'uploads/microcourses'
 UPLOAD_FOLDER_MAIN = 'uploads/maincourses'
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'dasd'
-
+CORS(app)
 lt = LibreTranslateAPI("https://libretranslate.de/")
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///users.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -46,23 +47,23 @@ class User(db.Model):
 
 class MicroCourse(db.Model):
     course_id = db.Column(db.Integer, primary_key=True)
-    video_path = db.Column(db.String(255), nullable=False)
-    video_title = db.Column(db.String(100), nullable=False)
+    url = db.Column(db.String(255), nullable=False)
+    title = db.Column(db.String(100), nullable=False)
     description = db.Column(db.String(500), nullable=False)
     date_uploaded = db.Column(db.Date, default=datetime.utcnow)
 
     def __repr__(self):
-        return f"<MicroCourse {self.video_title}>"
+        return f"<MicroCourse {self.url}>"
 
 class MainCourse(db.Model):
     course_id = db.Column(db.Integer, primary_key=True)
-    video_path = db.Column(db.String(255), nullable=False)
-    video_title = db.Column(db.String(100), nullable=False)
+    url = db.Column(db.String(255), nullable=False)
+    title = db.Column(db.String(100), nullable=False)
     description = db.Column(db.String(500), nullable=False)
     date_uploaded = db.Column(db.Date, default=datetime.utcnow)
 
     def __repr__(self):
-        return f"<MainCourse {self.video_title}>"
+        return f"<MainCourse {self.url}>"
 
 with app.app_context():
     db.create_all()
@@ -82,17 +83,19 @@ class otherfunc():
         
         return total_score
 
-    def avl_courses():
+    def all_courses():
             micro_courses = MicroCourse.query.all()
             main_courses = MainCourse.query.all()
             micro_course_list = [{
-                'title': course.video_title,
+                'url': course.url,
+                'title': course.title,
                 'description': course.description,
                 'date_uploaded': course.date_uploaded
             } for course in micro_courses]
 
             main_course_list = [{
-                'title': course.video_title,
+                'url': course.url,
+                'title': course.title,
                 'description': course.description,
                 'date_uploaded': course.date_uploaded
             } for course in main_courses]
@@ -177,7 +180,7 @@ class otherfunc():
         translated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
         return translated_text
 
-@app.route('/')
+@app.route('/',methods=['POST'])
 def home():
     data = request.get_json()
     name = data.get('name')
@@ -192,17 +195,31 @@ def home():
 
     info['users'] = user_info
     info['certificates'] = user.certificates if user.certificates else []
+    info['badges'] = user.badges
     info['streak'] = user.streaks
-    info['courses'] = otherfunc.all_courses
+    info['courses'] = otherfunc.all_courses()
 
     return jsonify(info), 200
 
-@app.route('/translate')
+@app.route('/translate', methods=['POST'])
 def translate():
     data = request.get_json()
     name = data.get('name')
     user = User.query.filter_by(name=name).first()
     return jsonify(lt.translate(data.get('text'), target_lang=user.preferred_language))
+
+@app.route('/add-course', methods=['POST'])
+def add_course():
+    data = request.get_json()
+    new_course = MicroCourse(
+        url = data.get('url'),
+        title = data.get('title'),
+        description = data.get('description'),
+        date_uploaded = data.get("date")
+    )
+    db.session.add(new_course)
+    db.session.commit()
+    return jsonify({'message': 'done'}), 200
 
 @app.route('/register', methods=['POST'])
 def register():
@@ -238,13 +255,13 @@ def register():
     db.session.add(new_user)
     db.session.commit()
 
-    return jsonify({"message": "User registered successfully"}), 201
+    return jsonify({"message": "User registered successfully"}), 200
 
 @app.route('/login', methods=['POST'])
 def login():
     data = request.get_json()
 
-    if not data or not data.get('username') or not data.get('password'):
+    if not data or not data.get('email') or not data.get('password'):
         return jsonify({"message": "Username and password are required"}), 400
 
     email = data.get('email')
@@ -257,7 +274,8 @@ def login():
     if not bcrypt.check_password_hash(user.password, password):
         return jsonify({"message": "Invalid password"}), 401
 
-    return jsonify({"message": "Login successful", "username": user.username}), 200
+    return jsonify({"message": "Login successful", "name": user.name}), 200
+
 
 @app.route('/stream_course/<int:course_id>', methods=['GET'])
 def stream_course(course_id):
@@ -325,26 +343,26 @@ def stream_course(course_id):
 def complete_course():
     data = request.get_json()
 
-    username = data.get('username')
-    course_id = data.get('course_id')
+    name = data.get('name')
+    title = data.get('title')
     course_type = data.get('type')
 
-    user = User.query.filter_by(username=username).first()
+    user = User.query.filter_by(name=name).first()
     if not user:
         return jsonify({"message": "User not found"}), 404
 
     # Get the course by course_id
     if course_type == 'micro':
-        course = MicroCourse.query.filter_by(course_id=course_id).first()
+        course = MicroCourse.query.filter_by(title=title).first()
     else:
-        course = MainCourse.query.filter_by(course_id=course_id).first()
+        course = MainCourse.query.filter_by(title=title).first()
     if not course:
         return jsonify({"message": "Course not found"}), 404
 
     new_badge = {
         "course_id": course.course_id,
-        "course_name": course.video_title,
-        "score": 0, 
+        "course_name": course.title,
+        "score": course.course_id, 
         "date": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S") 
     }
 
@@ -369,7 +387,6 @@ def get_leaderboard():
     for user in users:
         score = otherfunc.calculate_user_score(user)
         user_scores.append({
-            'username': user.username,
             'score': score,
             'name': user.name,
             'badges_count': len(user.badges) if user.badges else 0,
@@ -382,7 +399,7 @@ def get_leaderboard():
 
     return jsonify(sorted_user_scores), 200
 
-@app.route('/translate_pdf')
+@app.route('/translate_pdf', methods=['POST'])
 def translate_pdf():
     data = request.get_json()
     name = data.get('name')
@@ -393,13 +410,12 @@ def translate_pdf():
 
     summary = otherfunc.summarize_text(extracted_text)
 
-    print("Translating summary...")
     translated_summary = otherfunc.translate_text(summary, user.preferred_language)
     os.remove(pdf_path)
 
     return jsonify(summary, translated_summary)
 
-@app.route('/video')
+@app.route('/video', methods=['POST'])
 def transcribe_video():
     data = request.get_json()
     name = data.get('name')
@@ -420,8 +436,8 @@ def transcribe_video():
     os.remove(video_path)
     os.remove(audio_path)
     
-    return summary, translated_summary
+    return jsonify(summary, translated_summary)
 
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(host='10.80.2.25', debug=True)
