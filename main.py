@@ -6,6 +6,7 @@ import fitz
 from flask_cors import CORS
 import moviepy as mp
 import torchaudio
+from PIL import Image, ImageDraw, ImageFont
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline, WhisperProcessor, WhisperForConditionalGeneration
 from datetime import datetime, timedelta
 from libretranslatepy import LibreTranslateAPI
@@ -38,7 +39,6 @@ class User(db.Model):
     preferred_language = db.Column(db.Integer)
     badges = db.Column(db.JSON) 
     certificates = db.Column(db.JSON) 
-    attendance = db.Column(db.Integer, default=10)
     streaks = db.Column(db.Integer, default=7)
     prev_date = db.Column(db.Date)
 
@@ -78,9 +78,7 @@ class otherfunc():
         badge_score = sum(badge['score'] for badge in user.badges) if user.badges else 0
         certificate_score = sum(certificate['score'] for certificate in user.certificates) if user.certificates else 0
         streak_score = user.streaks * 1.5
-        attendance_score = user.attendance
-        total_score = badge_score + certificate_score + streak_score + attendance_score
-        
+        total_score = badge_score + certificate_score + streak_score
         return total_score
 
     def all_courses():
@@ -148,11 +146,9 @@ class otherfunc():
                 if chunk:
                     video_file.write(chunk)
         return save_path
-
     def extract_audio(video_path, audio_path):
         video = mp.VideoFileClip(video_path)
-        video.audio.write_audiofile(audio_path)
-        
+        video.audio.write_audiofile(audio_path)      
     def transcribe_audio(audio_path, model_name="openai/whisper-tiny"):
         processor = WhisperProcessor.from_pretrained(model_name)
         model = WhisperForConditionalGeneration.from_pretrained(model_name)
@@ -164,21 +160,27 @@ class otherfunc():
         predicted_ids = model.generate(inputs["input_features"])
         transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
         return transcription
-
     def summarize_text(text, model_name="t5-small"):
         summarizer = pipeline("summarization", model=model_name)
         summary = summarizer(text, max_length=50, min_length=10, do_sample=False)
         return summary[0]["summary_text"]
+    
+    def generate_certificate(name, course_title, date):
+        cert_path = "./static/certificate.png"
+        cert = Image.open(cert_path)
+        draw = ImageDraw.Draw(cert)
+        font_path = "C:\\Windows\\Fonts\\arial.ttf"
+        name_font = ImageFont.truetype(font_path, 70)
+        course_font = ImageFont.truetype(font_path, 20)
+        date_font = ImageFont.truetype(font_path, 20)
+        name_position = (270, 230)
+        course_position = (250, 380)
+        date_position = (150, 440) 
+        draw.text(name_position, name, font=name_font, fill="black")
+        draw.text(course_position, f"{course_title} course", font=course_font, fill="black")
+        draw.text(date_position, date, font=date_font, fill="black")
+        cert.save("final_certificate.png")
 
-    def translate_text(text, target_language="fr"):
-        model_name = f"Helsinki-NLP/opus-mt-en-{target_language}"
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
-        
-        inputs = tokenizer(text, return_tensors="pt", truncation=True)
-        outputs = model.generate(**inputs)
-        translated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        return translated_text
 
 @app.route('/',methods=['POST'])
 def home():
@@ -199,27 +201,25 @@ def home():
     info['streak'] = user.streaks
     info['courses'] = otherfunc.all_courses()
 
+    if user:
+        today = datetime.utcnow().date()
+        prev_date = user.prev_date
+        if prev_date:
+            if prev_date == today - timedelta(days=1):
+                user.streaks += 1
+            elif prev_date < today - timedelta(days=1):
+                user.streaks = 0
+        else:
+            user.streaks = 1
+        user.prev_date = today
+        db.session.commit()
     return jsonify(info), 200
 
 @app.route('/translate', methods=['POST'])
 def translate():
     data = request.get_json()
-    name = data.get('name')
-    user = User.query.filter_by(name=name).first()
-    return jsonify(lt.translate(data.get('text'), target_lang=user.preferred_language))
-
-@app.route('/add-course', methods=['POST'])
-def add_course():
-    data = request.get_json()
-    new_course = MicroCourse(
-        url = data.get('url'),
-        title = data.get('title'),
-        description = data.get('description'),
-        date_uploaded = data.get("date")
-    )
-    db.session.add(new_course)
-    db.session.commit()
-    return jsonify({'message': 'done'}), 200
+    user = User.query.filter_by(name=data.get('name')).first()
+    return jsonify({"message": otherfunc.translate_text(data.get('text'), user.preferred_language)})
 
 @app.route('/register', methods=['POST'])
 def register():
@@ -249,7 +249,6 @@ def register():
         age=age,
         gender=gender,
         preferred_language=preferred_language,
-        attendance=0,
         streaks=0
     )
     db.session.add(new_user)
@@ -339,42 +338,36 @@ def stream_course(course_id):
 
     return jsonify({"message": "User not found"}), 404
 
-@app.route('/complete_course', methods=['POST'])
+@app.route('/cc', methods=['POST'])
 def complete_course():
     data = request.get_json()
 
     name = data.get('name')
     title = data.get('title')
-    course_type = data.get('type')
 
     user = User.query.filter_by(name=name).first()
-    if not user:
-        return jsonify({"message": "User not found"}), 404
+    course = MainCourse.query.filter_by(title=title).first()
+    course_type = 'main'
 
-    # Get the course by course_id
-    if course_type == 'micro':
-        course = MicroCourse.query.filter_by(title=title).first()
-    else:
-        course = MainCourse.query.filter_by(title=title).first()
     if not course:
-        return jsonify({"message": "Course not found"}), 404
+        course = MicroCourse.query.filter_by(title=title).first()
+        course_type = 'micro'
 
     new_badge = {
         "course_id": course.course_id,
         "course_name": course.title,
-        "score": course.course_id, 
-        "date": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S") 
+        "score": course.course_id,
+        "date": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     }
-
     if user.badges is None:
         user.badges = []
     if user.certificates is None:
         user.certificates = []
-    
     if course_type == 'micro':
         user.badges.append(new_badge)
     else:
         user.certificates.append(new_badge)
+        otherfunc.generate_certificate(user.name, course.title, datetime.utcnow().strftime("%Y-%m-%d"))
     db.session.commit()
 
     return jsonify({"message": "Course completed and badge awarded", "badge": new_badge}), 200
@@ -389,10 +382,10 @@ def get_leaderboard():
         user_scores.append({
             'score': score,
             'name': user.name,
+            "phone_no": user.number,
             'badges_count': len(user.badges) if user.badges else 0,
             'certificates_count': len(user.certificates) if user.certificates else 0,
             'streaks': user.streaks,
-            'attendance': user.attendance
         })
 
     sorted_user_scores = sorted(user_scores, key=lambda x: x['score'], reverse=True)
@@ -424,7 +417,7 @@ def transcribe_video():
     video_path = "temp_video.mp4"
     audio_path = "temp_audio.wav"
     otherfunc.download_video(data.get('url'), video_path)
-    
+
     otherfunc.extract_audio(video_path, audio_path)
 
     transcribed_text = otherfunc.transcribe_audio(audio_path)
@@ -435,9 +428,24 @@ def transcribe_video():
 
     os.remove(video_path)
     os.remove(audio_path)
-    
+    print(summary, translated_summary)
     return jsonify(summary, translated_summary)
 
 
 if __name__ == '__main__':
     app.run(host='10.80.2.25', debug=True)
+
+"""
+Hey guys, i doubt if this paragraph is ever going to be found by anyone
+but more so for the tradition of writing my experience as i always do with any other project
+this shall continue :). this code is from my first ever 24h hackathon, or maybe i could
+even say the first ever tech event i atteneded as BMSCE. was it fun? definitely. i feel like
+i made so much memories here that i wouldnt even need to write about it to remember it, this is 
+a lasting memory. no idea how this would go but for now, signing off
+-05/12/2024
+
+hi uyrurdfjytdtrdfobvcdyrdfgo87tcyxrsdugucrxytyoyuyeg
+jddytd
+hgfhguwedeuydudnehaudeuyufdruyfyrfy
+last line to make the code 500lines :0 BYEEEEEEEEEEE
+"""
